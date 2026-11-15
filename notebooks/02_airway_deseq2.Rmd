@@ -1,0 +1,247 @@
+---
+title: "Part B: Differential expression in dexamethasone-treated airway cells"
+output:
+  github_document:
+    toc: true
+    html_preview: false
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(42)
+fig_dir <- "../results/figures"
+tab_dir <- "../results/tables"
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(tab_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 1. Data
+
+The `airway` dataset has 8 samples: airway smooth muscle cells from 4 donors (`cell`), each treated or untreated with dexamethasone (`dex`), a glucocorticoid. Because every donor gives one treated and one untreated sample, the design is **paired**. Donors differ from one another at baseline, so we model donor as well as treatment.
+
+```{r load}
+library(airway)
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(apeglm)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+data("airway")
+se <- airway
+se$dex <- relevel(se$dex, ref = "untrt")   # untreated is the baseline
+as.data.frame(colData(se))[, c("cell", "dex")]
+dim(se)
+```
+
+## 2. Design and low-count filtering
+
+`~ cell + dex` tells DESeq2 to estimate each donor's baseline, then test the dex effect inside donors. The variable you test goes last.
+
+Genes with almost no reads cannot reach significance. Keeping them only adds to the number of tests. We keep genes with at least 10 reads in at least 4 samples (4 is the size of the smallest group).
+
+```{r filter}
+dds <- DESeqDataSet(se, design = ~ cell + dex)
+keep <- rowSums(counts(dds) >= 10) >= 4
+dds <- dds[keep, ]
+n_genes_kept <- nrow(dds)
+n_genes_kept
+```
+
+## 3. Fit and results
+
+`DESeq()` estimates size factors (sequencing depth), dispersions (gene-level variability shared across genes) and fits a negative binomial model per gene. `alpha = 0.05` sets the FDR target used for independent filtering.
+
+```{r fit}
+dds <- DESeq(dds)
+resultsNames(dds)
+res <- results(dds, name = "dex_trt_vs_untrt", alpha = 0.05)
+summary(res)
+
+sig <- subset(res, padj < 0.05)
+n_sig  <- nrow(sig)
+n_up   <- sum(sig$log2FoldChange > 0)
+n_down <- sum(sig$log2FoldChange < 0)
+c(total = n_sig, up = n_up, down = n_down)
+```
+
+## 4. Shrinkage
+
+With 4 donors, log2 fold changes for low-count genes are noisy. apeglm pulls unreliable estimates toward zero. Use shrunken values for ranking and plots. The p-values stay the same.
+
+```{r shrink}
+res_lfc <- lfcShrink(dds, coef = "dex_trt_vs_untrt", type = "apeglm")
+
+symbols <- mapIds(org.Hs.eg.db, keys = rownames(res_lfc), column = "SYMBOL",
+                  keytype = "ENSEMBL", multiVals = "first")
+res_df <- as.data.frame(res_lfc)
+res_df$ensembl <- rownames(res_df)
+res_df$symbol  <- symbols
+res_df <- res_df[order(res_df$padj), ]
+write.csv(res_df, file.path(tab_dir, "airway_deseq2_results.csv"), row.names = FALSE)
+head(res_df[, c("symbol", "baseMean", "log2FoldChange", "padj")], 20)
+```
+
+## 5. Sanity check against known biology
+
+Glucocorticoids are known to induce FKBP5, DUSP1, PER1 and TSC22D3. CRISPLD2 was the headline gene in Himes et al. 2014. If these are not up-regulated, something upstream is wrong.
+
+```{r sanity}
+known <- c("FKBP5", "DUSP1", "PER1", "TSC22D3", "CRISPLD2")
+res_df[res_df$symbol %in% known, c("symbol", "log2FoldChange", "padj")]
+```
+
+**Interpretation.** All five known glucocorticoid-response genes are up-regulated in treated cells and all are far past the FDR cutoff: FKBP5 (shrunken log2FC 3.97, about 16-fold), PER1 (3.17), TSC22D3 (3.11), DUSP1 (2.94) and CRISPLD2 (2.60). DUSP1 and PER1 are among the top 15 genes overall. The expected biology comes out in the expected direction, so the sample labels, the reference level and the contrast are set up correctly.
+
+## 6. PCA on variance-stabilized counts
+
+VST puts counts on a scale where variance does not depend on the mean, so PCA isn't dominated by highly expressed genes. `blind = FALSE` uses the design when estimating the transform.
+
+```{r pca}
+vsd <- vst(dds, blind = FALSE)
+pca_df <- plotPCA(vsd, intgroup = c("dex", "cell"), returnData = TRUE)
+pv <- round(100 * attr(pca_df, "percentVar"))
+p_pca <- ggplot(pca_df, aes(PC1, PC2, color = dex, shape = cell)) +
+  geom_point(size = 4) +
+  labs(x = paste0("PC1: ", pv[1], "% variance"), y = paste0("PC2: ", pv[2], "% variance"),
+       title = "Airway samples, VST counts") +
+  theme_bw()
+ggsave(file.path(fig_dir, "airway_pca.png"), p_pca, width = 6, height = 4.5, dpi = 150)
+p_pca
+```
+
+**Interpretation.** PC1 (48% of variance) splits the samples cleanly by treatment: all untreated samples sit on the left and all treated samples on the right. PC2 (24%) separates donors, mostly donor N080611 from the other three, and each donor keeps roughly the same PC2 position whether treated or not. So about a quarter of the variation is a stable donor baseline that has nothing to do with dexamethasone. Putting `cell` in the design lets DESeq2 account for that baseline instead of treating it as noise.
+
+## 7. Volcano and MA plots
+
+```{r volcano}
+vdf <- res_df[!is.na(res_df$padj), ]
+vdf$sig <- vdf$padj < 0.05 & abs(vdf$log2FoldChange) > 1
+top_lab <- head(vdf[vdf$sig, ], 15)
+p_vol <- ggplot(vdf, aes(log2FoldChange, -log10(padj), color = sig)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_text_repel(data = top_lab, aes(label = symbol), color = "black", size = 3, max.overlaps = 20) +
+  scale_color_manual(values = c(`FALSE` = "grey70", `TRUE` = "firebrick")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  labs(title = "Dexamethasone vs untreated (shrunken LFC)", color = "padj < 0.05 & |LFC| > 1") +
+  theme_bw()
+ggsave(file.path(fig_dir, "airway_volcano.png"), p_vol, width = 7, height = 5, dpi = 150)
+p_vol
+```
+
+```{r ma}
+png(file.path(fig_dir, "airway_ma.png"), width = 900, height = 650, res = 150)
+plotMA(res_lfc, ylim = c(-5, 5), main = "MA plot, apeglm-shrunken LFC")
+invisible(dev.off())
+plotMA(res_lfc, ylim = c(-5, 5), main = "MA plot, apeglm-shrunken LFC")
+```
+
+## 8. Heatmap of top 30 genes
+
+Rows are centered so each gene shows deviation from its own mean.
+
+```{r heatmap}
+top30 <- head(rownames(res_df)[!is.na(res_df$padj)], 30)
+mat <- assay(vsd)[top30, ]
+mat <- mat - rowMeans(mat)
+rownames(mat) <- ifelse(is.na(symbols[top30]), top30, symbols[top30])
+ann <- as.data.frame(colData(vsd)[, c("dex", "cell")])
+ph <- pheatmap(mat, annotation_col = ann, show_colnames = FALSE, silent = TRUE)
+png(file.path(fig_dir, "airway_heatmap_top30.png"), width = 7, height = 8, units = "in", res = 150)
+grid::grid.draw(ph$gtable)
+invisible(dev.off())
+grid::grid.newpage()
+grid::grid.draw(ph$gtable)
+```
+
+## 9. GO enrichment
+
+The universe is every gene that was tested, not the whole genome. Using the whole genome inflates enrichment because untested genes can never be "significant."
+
+```{r go}
+sig_genes <- rownames(res_df)[which(res_df$padj < 0.05 & abs(res_df$log2FoldChange) > 1)]
+ego <- enrichGO(gene = sig_genes, universe = rownames(dds), OrgDb = org.Hs.eg.db,
+                keyType = "ENSEMBL", ont = "BP", pAdjustMethod = "BH",
+                qvalueCutoff = 0.05, readable = TRUE)
+write.csv(as.data.frame(ego), file.path(tab_dir, "airway_go_bp.csv"), row.names = FALSE)
+p_go <- enrichplot::dotplot(ego, showCategory = 15) + ggtitle("GO biological process")
+ggsave(file.path(fig_dir, "airway_go_dotplot.png"), p_go, width = 8, height = 6, dpi = 150)
+p_go
+```
+
+**Interpretation.** The top terms are about vascular and circulatory biology (circulatory system process, blood vessel development, angiogenesis, regulation of blood circulation), receptor tyrosine kinase signaling, and regulation of the MAPK cascade. This fits the cell type and the drug. Airway smooth muscle cells control contractility and tissue remodeling, and glucocorticoids are known to dampen inflammatory MAPK signaling, partly by inducing the phosphatase DUSP1 seen above. GO enrichment only describes which gene sets are over-represented, so these terms are hypotheses about function, not evidence of it.
+
+# Rigor checks
+
+## R1. Raw p-values versus FDR
+
+About `r n_genes_kept` genes were tested. At p < 0.05 with no true effects you would still expect about 5% false positives. Benjamini-Hochberg controls the expected share of false discoveries among the genes you call significant.
+
+```{r rigor_raw_vs_adj}
+n_raw <- sum(res$pvalue < 0.05, na.rm = TRUE)
+n_adj <- sum(res$padj < 0.05, na.rm = TRUE)
+expected_false_raw <- round(0.05 * sum(!is.na(res$pvalue)))
+c(raw_p_lt_0.05 = n_raw, padj_lt_0.05 = n_adj, expected_false_if_no_effects = expected_false_raw)
+```
+
+## R2. Paired versus unpaired design
+
+```{r rigor_design}
+dds_unpaired <- DESeqDataSet(se[keep, ], design = ~ dex)
+dds_unpaired <- DESeq(dds_unpaired, quiet = TRUE)
+res_unpaired <- results(dds_unpaired, name = "dex_trt_vs_untrt", alpha = 0.05)
+n_unpaired <- sum(res_unpaired$padj < 0.05, na.rm = TRUE)
+c(paired = n_adj, unpaired = n_unpaired)
+```
+
+**Interpretation.** The paired design finds 4,081 DE genes and the unpaired design finds 2,773, about 47% more with pairing. In `~ dex`, the donor-to-donor differences seen on PC2 have nowhere to go, so they end up in the residual variance and make each gene's treatment effect look noisier. In `~ cell + dex`, each donor's baseline is estimated separately and the treatment effect is measured within donors, so the residual variance is smaller and more genes pass the same FDR cutoff. Here pairing costs 3 degrees of freedom and gains a lot of power.
+
+## R3. Within-donor permutation test
+
+Shuffle treatment labels **inside each donor** so the pairing stays intact, refit, and count DE genes. With 4 donors there are 2^4 = 16 labelings. One is the real labeling. Flipping all 4 donors swaps "treated" and "untreated" everywhere, so it gives the same count with every fold change reversed. That leaves 14 labelings that mix the treatment signal, which serve as the null. This takes a few minutes.
+
+```{r rigor_permutation}
+cells <- levels(se$cell)
+flips <- as.matrix(expand.grid(rep(list(c(FALSE, TRUE)), length(cells))))
+colnames(flips) <- cells
+
+perm_counts <- integer(nrow(flips))
+for (i in seq_len(nrow(flips))) {
+  se_p <- se[keep, ]
+  d <- as.character(se_p$dex)
+  for (cl in cells[flips[i, ]]) {
+    idx <- se_p$cell == cl
+    d[idx] <- ifelse(d[idx] == "trt", "untrt", "trt")
+  }
+  se_p$dex <- relevel(factor(d), ref = "untrt")
+  dp <- DESeq(DESeqDataSet(se_p, design = ~ cell + dex), quiet = TRUE)
+  rp <- results(dp, name = "dex_trt_vs_untrt", alpha = 0.05)
+  perm_counts[i] <- sum(rp$padj < 0.05, na.rm = TRUE)
+}
+
+n_flipped <- rowSums(flips)
+perm_df <- data.frame(flips, n_flipped = n_flipped, n_de = perm_counts)
+perm_df$type <- ifelse(n_flipped == 0, "real",
+                ifelse(n_flipped == length(cells), "all flipped (mirror of real)", "null"))
+write.csv(perm_df, file.path(tab_dir, "airway_permutation.csv"), row.names = FALSE)
+perm_df
+
+null_counts <- perm_df$n_de[perm_df$type == "null"]
+c(real = perm_df$n_de[perm_df$type == "real"],
+  null_median = median(null_counts), null_max = max(null_counts))
+```
+
+**Interpretation.** The real labeling gives 4,081 DE genes. The 14 null labelings give a median of 0 and a maximum of 20. Ten of the 14 give no DE genes at all. The null labelings also come in mirror pairs with identical counts (flipping donor N080611 alone and flipping the other three both give 20), for the same reason the all-flipped labeling mirrors the real one. So the real result is about 200 times the worst null case, and the FDR procedure is not producing thousands of hits from donor structure alone. One caveat: with only 16 labelings, the smallest possible permutation p-value is 2/16 = 0.125 (the real labeling and its mirror), so this test can't give a small p-value by itself. What it shows is that the size of the null counts is tiny next to the real one.
+
+# Session info
+
+Package versions used for this run, so the numbers can be reproduced.
+
+```{r session_info}
+sessionInfo()
+```

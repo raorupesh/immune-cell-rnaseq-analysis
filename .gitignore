@@ -1,0 +1,10 @@
+data/
+*.h5ad
+.venv/
+.ipynb_checkpoints/
+__pycache__/
+.Rhistory
+.RData
+.Rproj.user/
+*.html
+notebooks/*_cache/

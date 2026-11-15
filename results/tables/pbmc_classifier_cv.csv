@@ -1,0 +1,3 @@
+model,accuracy_mean,accuracy_sd,balanced_acc_mean,balanced_acc_sd
+logistic_regression,0.9602,0.0088,0.9429,0.0112
+random_forest,0.9591,0.0087,0.9149,0.0406

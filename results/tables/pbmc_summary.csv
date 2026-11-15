@@ -1,0 +1,7 @@
+,value
+cells_raw,2700
+cells_after_qc,2638
+genes_after_qc,13714
+highly_variable_genes,1838
+leiden_clusters_res0.9,8
+cell_types,8

@@ -1,0 +1,14 @@
+name: immune-omics
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - scanpy>=1.10
+  - python-igraph
+  - leidenalg
+  - scikit-learn
+  - pandas
+  - matplotlib
+  - seaborn
+  - jupyterlab
+  - ipykernel
