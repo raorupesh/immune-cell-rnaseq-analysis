@@ -1,3 +1,5 @@
+![Immune Cell RNA-seq Analysis Pipeline: single-cell clustering, paired DESeq2 and robustness checks, built with Python, R, Scanpy and DESeq2](assets/banner.png)
+
 # Immune Cell Omics Analysis Pipeline
 
 A reproducible analysis of two public immune-related datasets, with statistical checks on top of standard workflows.
